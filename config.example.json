@@ -1,0 +1,124 @@
+{
+  "_comment": "이 파일을 config.json 으로 복사한 뒤 값만 고치세요. 상세 설명은 README.md 참고. (config.json 은 .gitignore 됨)",
+  "name": "홍길동",
+  "search": {
+    "_filters_comment": "채용 플랫폼 사이트 필터와 동일. 빈 배열/생략 = 전체. 리스트는 다중선택(OR), 서로 다른 필터끼리는 AND.",
+    "filters": {
+      "depthTwos": [
+        "서버_백엔드",
+        "웹풀스택",
+        "소프트웨어엔지니어"
+      ],
+      "regions": [
+        "서울",
+        "경기"
+      ],
+      "employeeTypes": [
+        "정규직"
+      ],
+      "educations": [
+        "무관"
+      ],
+      "companyTypes": [
+        "대기업",
+        "유니콘",
+        "중견기업"
+      ],
+      "careerMin": 1,
+      "careerMax": 7
+    },
+    "keywords": [],
+    "max_pages": 15,
+    "page_size": 100,
+    "sort": "RECENT",
+    "new_within_days": 7,
+    "max_detail_fetches": 200
+  },
+  "filter": {
+    "target_depth_ones": [
+      "IT_개발",
+      "AI_데이터"
+    ],
+    "primary_depth_twos": [
+      "서버_백엔드",
+      "웹풀스택",
+      "소프트웨어엔지니어"
+    ],
+    "secondary_depth_twos": [
+      "시스템_네트워크",
+      "기타IT_개발"
+    ],
+    "regions_preferred": [
+      "서울",
+      "경기",
+      "인천",
+      "원격",
+      "재택"
+    ],
+    "exclude_title_keywords": [
+      "프론트엔드",
+      "frontend",
+      "안드로이드",
+      "ios",
+      "게임 클라이언트",
+      "QA 엔지니어",
+      "영업",
+      "디자이너",
+      "마케터"
+    ]
+  },
+  "profile": {
+    "career_years": 4,
+    "tech_primary": [
+      "java",
+      "spring",
+      "spring boot",
+      "jpa",
+      "mysql",
+      "redis",
+      "docker"
+    ],
+    "tech_secondary": [
+      "python",
+      "kafka",
+      "elasticsearch",
+      "kubernetes",
+      "graphql"
+    ]
+  },
+  "scoring": {
+    "weights": {
+      "role": 35,
+      "career": 25,
+      "tech_title": 20,
+      "region": 10,
+      "employment": 10
+    },
+    "career_tolerance_over": 2,
+    "rule_threshold": 45,
+    "notify_threshold": 60
+  },
+  "llm": {
+    "_comment": "provider: claude_cli(Claude Code 구독, 키 불필요) | api(ANTHROPIC_API_KEY 필요) | none",
+    "enabled": true,
+    "provider": "claude_cli",
+    "model": "claude-sonnet-5",
+    "cli_model": "sonnet",
+    "max_calls_per_run": 45,
+    "max_output_tokens": 800
+  },
+  "output": {
+    "matches_dir": "matches/honggildong",
+    "state_file": "state/honggildong.json",
+    "profile_file": "profile.md",
+    "min_score_in_note": 50,
+    "seen_retention_days": 90
+  },
+  "enrich": {
+    "_comment": "채용 플랫폼 본문이 min_chars 미만이면 원본(redirectUrl)을 crawl4ai로 크롤해 실제 JD를 LLM에 전달. 실패 시 폴백. crawl4ai 미설치면 자동 생략.",
+    "enabled": true,
+    "min_chars": 1000,
+    "max_crawls_per_run": 20,
+    "page_timeout_sec": 45
+  }
+}

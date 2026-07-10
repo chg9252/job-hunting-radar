@@ -1,0 +1,736 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+platform_watcher — 채용 플랫폼(platform.com) 채용 공고를 내 이력에 대입해 매칭 공고를 알려주는 워처.
+
+파이프라인:
+  1) 공개 API(https://api.example.com/api/recruitments)에서 keyword별로 공고 목록 수집
+  2) 직무(depthTwos)·경력·지역으로 규칙 기반 프리필터 + 점수화
+  3) 이전 실행에서 본 id와 diff → "새로 뜬" 공고만 추림
+  4) 규칙 문턱 통과 + 신규 공고만 상세 API 조회 → LLM(Claude)이 이력서와 정밀 대조해 재점수
+  5) Obsidian 노트(matches/YYYY-MM-DD.md)로 매칭 다이제스트 출력 + 본 id 저장
+
+의존성: 표준 라이브러리만으로 규칙 기반 동작. LLM 단계는 `anthropic` + ANTHROPIC_API_KEY 있을 때만.
+사용법:  python platform_watcher.py           (전체 실행)
+         python platform_watcher.py --no-llm  (규칙 점수만)
+         python platform_watcher.py --seed    (알림 없이 현재 공고를 seen에 기록만, 첫 세팅용)
+         python platform_watcher.py --dry-run (노트/상태 저장 안 함, 콘솔 출력만)
+"""
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+# ---- Windows 콘솔에서 한글 깨짐 방지 ----
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+API_LIST = "https://api.example.com/api/recruitments"
+API_DETAIL = "https://api.example.com/api/recruitments/{id}"
+DETAIL_PAGE = "https://platform.com/recruitment/{id}"
+UA = "Mozilla/5.0 (platform-watcher; personal job-match tool)"
+
+
+# =========================================================================
+# 유틸
+# =========================================================================
+def log(msg):
+    print(f"[{dt.datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def load_config(path="config.json"):
+    if not os.path.isabs(path):
+        path = os.path.join(HERE, path)
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def load_profile(cfg):
+    path = os.path.join(HERE, cfg["output"]["profile_file"])
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
+
+
+def http_get_json(url, retries=3, pause=1.5):
+    last = None
+    for i in range(retries):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=25) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except Exception as e:  # noqa: BLE001
+            last = e
+            time.sleep(pause * (i + 1))
+    raise RuntimeError(f"GET 실패: {url} :: {last}")
+
+
+# =========================================================================
+# 1) 수집
+# =========================================================================
+# 채용 플랫폼 사이트 필터 = API 파라미터. 리스트형(다중값) + 스칼라형.
+_LIST_FILTER_KEYS = ("depthOnes", "depthTwos", "regions", "employeeTypes",
+                     "educations", "companyTypes", "deadlineTypes")
+_SCALAR_FILTER_KEYS = ("careerMin", "careerMax")
+
+
+def build_filter_qs(filters):
+    """config search.filters → 채용 플랫폼 필터 쿼리스트링. 빈 값은 생략(= 전체)."""
+    parts = []
+    for key in _LIST_FILTER_KEYS:
+        for v in filters.get(key) or []:
+            parts.append(f"{key}={urllib.parse.quote(str(v))}")
+    for key in _SCALAR_FILTER_KEYS:
+        if filters.get(key) is not None:
+            parts.append(f"{key}={filters[key]}")
+    return "&".join(parts)
+
+
+def fetch_listings(cfg):
+    """채용 플랫폼 필터(서버단) + 선택적 keyword로 페이지를 긁어 id 기준 dedupe."""
+    s = cfg["search"]
+    fqs = build_filter_qs(s.get("filters") or {})
+    max_pages = s.get("max_pages", s.get("pages_per_keyword", 8))
+    # keywords 있으면 각 키워드로 추가 검색, 없으면 필터만으로 1회 순회
+    keywords = s.get("keywords") or [None]
+    by_id = {}
+    for kw in keywords:
+        label = kw or "(필터만)"
+        total = "?"
+        for pg in range(max_pages):
+            bits = [fqs, f"size={s['page_size']}", f"page={pg}"]
+            if s.get("sort"):
+                bits.append(f"sort={s['sort']}")
+            if kw:
+                bits.append(f"keyword={urllib.parse.quote(kw)}")
+            url = f"{API_LIST}?" + "&".join(b for b in bits if b)
+            try:
+                data = http_get_json(url).get("data") or {}
+            except RuntimeError as e:
+                log(f"  ! '{label}' p{pg} 수집 실패: {e}")
+                break
+            total = data.get("totalElements", total)
+            content = data.get("content") or []
+            for it in content:
+                by_id[it["id"]] = it
+            if data.get("last") or not content:
+                break
+        log(f"  · '{label}' 필터 대상 {total}건 → 누적 수집 {len(by_id)}건")
+    return list(by_id.values())
+
+
+def fetch_detail(rid):
+    data = http_get_json(API_DETAIL.format(id=rid)).get("data") or {}
+    return data
+
+
+def flatten_content(node, out):
+    """상세의 TipTap/ProseMirror content(JSON doc)를 평문으로."""
+    if isinstance(node, dict):
+        if node.get("type") == "text" and node.get("text"):
+            out.append(node["text"])
+        for v in node.get("content", []) or []:
+            flatten_content(v, out)
+    elif isinstance(node, list):
+        for v in node:
+            flatten_content(v, out)
+
+
+def created_age_days(created_at):
+    """createdAt(ISO) → 오늘까지 경과일. 파싱 실패 시 None."""
+    if not created_at:
+        return None
+    try:
+        d0 = dt.date.fromisoformat(str(created_at)[:10])
+    except ValueError:
+        return None
+    return (dt.date.today() - d0).days
+
+
+def detail_to_text(detail):
+    parts = []
+    flatten_content(detail.get("content"), parts)
+    body = " ".join(parts)
+    kw = detail.get("keywords") or []
+    if kw:
+        body += "\n[태그] " + ", ".join(kw)
+    return body.strip()
+
+
+# =========================================================================
+# 1-b) enrich: 채용 플랫폼 본문이 빈약하면 원본(채용사이트·기업 채용페이지)을 crawl4ai로 크롤
+# =========================================================================
+def crawl_originals(url_by_id, page_timeout_sec=45):
+    """{id: redirectUrl} → {id: 정제 JD 마크다운}. crawl4ai(로컬 헤드리스)로 SPA 렌더링.
+
+    crawl4ai 미설치·크롤 실패는 조용히 건너뜀(해당 id는 결과에 없음 → 폴백).
+    """
+    if not url_by_id:
+        return {}
+    try:
+        import asyncio  # noqa: WPS433
+        from crawl4ai import (  # noqa: WPS433
+            AsyncWebCrawler, BrowserConfig, CrawlerRunConfig,
+        )
+        from crawl4ai.content_filter_strategy import PruningContentFilter
+        from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
+    except ImportError:
+        log("  · enrich 생략: crawl4ai 미설치 (pip install crawl4ai)")
+        return {}
+
+    async def _run():
+        out = {}
+        bcfg = BrowserConfig(headless=True, verbose=False)
+        mdgen = DefaultMarkdownGenerator(
+            content_filter=PruningContentFilter(threshold=0.48))
+        run = CrawlerRunConfig(page_timeout=page_timeout_sec * 1000,
+                               wait_until="networkidle",
+                               markdown_generator=mdgen, verbose=False)
+        async with AsyncWebCrawler(config=bcfg) as crawler:
+            for rid, url in url_by_id.items():
+                try:
+                    r = await crawler.arun(url=url, config=run)
+                    md = getattr(r.markdown, "fit_markdown", "") or \
+                        getattr(r.markdown, "raw_markdown", "") or ""
+                    if r.success and len(md) > 200:
+                        out[rid] = md[:6000]
+                except Exception as e:  # noqa: BLE001
+                    log(f"  ! 원본 크롤 실패({rid[:8]}): {str(e)[:80]}")
+        return out
+
+    try:
+        return asyncio.run(_run())
+    except Exception as e:  # noqa: BLE001
+        log(f"  · enrich 생략: 크롤러 구동 실패 ({str(e)[:80]})")
+        return {}
+
+
+# =========================================================================
+# 2) 규칙 기반 점수
+# =========================================================================
+def score_role(item, f):
+    d2 = set(item.get("depthTwos") or [])
+    d1 = set(item.get("depthOnes") or [])
+    if d2 & set(f["primary_depth_twos"]):
+        return 1.0
+    if d2 & set(f["secondary_depth_twos"]):
+        return 0.6
+    if d1 & set(f["target_depth_ones"]):
+        return 0.35
+    return 0.0
+
+
+def score_career(item, years, tol_over):
+    cmin = item.get("careerMin")
+    cmax = item.get("careerMax")
+    if cmin is None and cmax is None:
+        return 0.7  # 경력 무관
+    cmin = 0 if cmin is None else cmin
+    cmax = 100 if cmax is None else cmax
+    if cmin <= years <= cmax:
+        return 1.0
+    if years < cmin:  # 공고가 더 높은 경력 요구
+        gap = cmin - years
+        if gap <= tol_over:
+            return max(0.3, 1.0 - 0.35 * gap)
+        return 0.1
+    # years > cmax : 내가 더 시니어 (신입~주니어 공고)
+    if cmax >= 2:
+        return 0.5
+    return 0.3
+
+
+def score_region(item, preferred):
+    regions = item.get("regions") or []
+    if not regions:
+        return 0.8
+    if any(any(p in r for p in preferred) for r in regions):
+        return 1.0
+    return 0.3
+
+
+def score_employment(item):
+    ets = item.get("employeeTypes") or []
+    if any("정규" in e for e in ets):
+        return 1.0
+    if not ets:
+        return 0.7
+    return 0.4
+
+
+def score_tech_title(item, prof):
+    title = (item.get("title") or "").lower()
+    p = sum(1 for t in prof["tech_primary"] if t in title)
+    s = sum(1 for t in prof["tech_secondary"] if t in title)
+    return min(1.0, 0.5 * p + 0.25 * s)
+
+
+def title_excluded(item, f):
+    title = (item.get("title") or "").lower()
+    return any(x.lower() in title for x in f["exclude_title_keywords"])
+
+
+def rule_score(item, cfg):
+    f, prof, sc = cfg["filter"], cfg["profile"], cfg["scoring"]
+    parts = {
+        "role": score_role(item, f),
+        "career": score_career(item, prof["career_years"], sc["career_tolerance_over"]),
+        "tech_title": score_tech_title(item, prof),
+        "region": score_region(item, f["regions_preferred"]),
+        "employment": score_employment(item),
+    }
+    w = sc["weights"]
+    total = sum(parts[k] * w[k] for k in parts) / sum(w.values()) * 100
+    return round(total, 1), parts
+
+
+# =========================================================================
+# 4) LLM 정밀 점수 (선택)
+# =========================================================================
+LLM_SYS = (
+    "너는 시니어 백엔드 채용 매칭 어시스턴트다. 지원자 이력과 채용 공고를 대조해 "
+    "적합도를 0~100으로 냉정하게 평가한다. 과장 없이, 공고에 명시된 요구사항 기준으로만 판단한다. "
+    "반드시 JSON만 출력한다."
+)
+
+
+def resolve_engine(cfg, no_llm):
+    """어떤 LLM 백엔드를 쓸지 결정. 반환: (engine dict | None, 사유 str | None).
+
+    engine = {"provider": "api"|"claude_cli", ...}
+    - claude_cli: 지금 쓰는 Claude Code 구독으로 채점(별도 키 불필요).
+    - api: anthropic SDK + ANTHROPIC_API_KEY.
+    """
+    if no_llm:
+        return None, "--no-llm 플래그"
+    llm = cfg["llm"]
+    if not llm.get("enabled"):
+        return None, "config에서 llm.enabled=false"
+    provider = llm.get("provider", "claude_cli")
+    if provider == "claude_cli":
+        import shutil  # noqa: WPS433
+        exe = shutil.which("claude") or shutil.which("claude.cmd")
+        if not exe:
+            return None, "claude CLI를 PATH에서 못 찾음"
+        return {"provider": "claude_cli", "exe": exe,
+                "model": llm.get("cli_model", "sonnet")}, None
+    if provider == "api":
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            return None, "ANTHROPIC_API_KEY 환경변수 없음"
+        try:
+            import anthropic  # noqa: WPS433
+        except ImportError:
+            return None, "anthropic 패키지 미설치 (pip install anthropic)"
+        return {"provider": "api", "client": anthropic.Anthropic(),
+                "model": llm.get("model", "claude-sonnet-5")}, None
+    return None, f"알 수 없는 provider: {provider}"
+
+
+def build_prompt(profile_text, item, detail_text):
+    schema_hint = (
+        '{"score": <0-100 정수>, "verdict": "<강력추천|추천|보통|낮음>", '
+        '"reasons": ["부합 근거 최대3"], "gaps": ["부족/리스크 최대3"], '
+        '"one_liner": "<한 줄 총평>", '
+        '"strategy": ["지원·합격 전략 2~4개(구체적으로): 서류에서 강조할 이력·키워드, '
+        '이력서/자기소개서 각색 포인트, 면접 대비 포인트, gaps 보완·프레이밍 방법"]}'
+    )
+    return (
+        f"## 지원자 이력\n{profile_text}\n\n"
+        f"## 채용 공고\n"
+        f"회사: {item.get('company',{}).get('name')}\n"
+        f"제목: {item.get('title')}\n"
+        f"직무: {', '.join(item.get('depthTwos') or [])}\n"
+        f"경력: {item.get('careerMin')}~{item.get('careerMax')}년 / 지역: {', '.join(item.get('regions') or [])}\n\n"
+        f"### 공고 상세\n"
+        f"(원문 크롤 결과라 사이트 네비게이션·로그인·회원가입·푸터·다른 공고 목록 같은 "
+        f"잡음이 섞였을 수 있다. 그런 부분은 무시하고 이 공고의 실제 채용 요구사항"
+        f"(담당업무·자격요건·우대사항·기술스택)만 근거로 삼아 판단하라.)\n"
+        f"{detail_text[:6000]}\n\n"
+        f"위 지원자가 이 공고에 지원했을 때의 서류 통과 가능성과 직무 적합도를 평가하라.\n"
+        f"**중요 — 필수와 우대를 구분해 가중치를 다르게 매겨라**: "
+        f"공고의 요구사항을 '필수(자격요건·필수·지원자격·Requirements)'와 "
+        f"'우대(우대사항·있으면 좋음·Preferred·Nice to have)'로 나눠라. "
+        f"필수 미충족은 서류 통과에 실질적 감점이다. 그러나 **우대 미충족은 경미하게** 평가하라 — "
+        f"대용량 트래픽 처리·특정 프레임워크·특정 인프라 같은 우대 역량은 "
+        f"보통 '입사해서 하게 되는 일'이지 입사 전 필수 조건이 아닌 경우가 많다. "
+        f"필수를 충족하면 우대가 여럿 비어도 지원 가치는 충분할 수 있다. "
+        f"우대 역량 부족을 필수 결격처럼 과하게 깎지 마라.\n"
+        f"strategy에는 이 지원자가 이 공고에 실제로 지원한다면 어떻게 어필하고 준비해야 합격 확률이 높아질지 "
+        f"실행 가능한 조언을 담아라.\n"
+        f"다음 JSON 형식만 출력:\n{schema_hint}"
+    )
+
+
+def _extract_json(txt):
+    m = re.search(r"\{.*\}", txt, re.S)
+    if not m:
+        raise ValueError(f"LLM 응답에서 JSON 못 찾음: {txt[:200]}")
+    return json.loads(m.group(0))
+
+
+def _score_api(engine, max_tokens, prompt):
+    resp = engine["client"].messages.create(
+        model=engine["model"], max_tokens=max_tokens,
+        system=LLM_SYS,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    txt = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+    return _extract_json(txt)
+
+
+# claude CLI를 볼트 밖 중립 폴더에서 실행 → 볼트 CLAUDE.md/스킬 미로드로 오버헤드 감소
+import tempfile  # noqa: E402
+CLI_CWD = os.path.join(tempfile.gettempdir(), "platform_watcher_cli")
+
+
+def _score_cli(engine, max_tokens, prompt):
+    import subprocess  # noqa: WPS433
+    os.makedirs(CLI_CWD, exist_ok=True)
+    full = LLM_SYS + "\n\n" + prompt
+    proc = subprocess.run(
+        [engine["exe"], "-p", "--output-format", "json", "--model", engine["model"]],
+        input=full, capture_output=True, text=True, encoding="utf-8",
+        cwd=CLI_CWD, timeout=180,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"claude CLI 실패(rc={proc.returncode}): {(proc.stderr or '')[:200]}")
+    envelope = json.loads(proc.stdout)
+    if envelope.get("is_error") or envelope.get("subtype") != "success":
+        raise RuntimeError(f"claude CLI 오류 응답: {str(envelope)[:200]}")
+    return _extract_json(envelope["result"])
+
+
+def llm_score(engine, max_tokens, profile_text, item, detail_text):
+    prompt = build_prompt(profile_text, item, detail_text)
+    if engine["provider"] == "api":
+        return _score_api(engine, max_tokens, prompt)
+    return _score_cli(engine, max_tokens, prompt)
+
+
+# =========================================================================
+# 3) 상태 (seen)
+# =========================================================================
+def load_seen(cfg):
+    path = os.path.join(HERE, cfg["output"]["state_file"])
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_seen(cfg, seen):
+    path = os.path.join(HERE, cfg["output"]["state_file"])
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # 오래된 기록 정리
+    keep = cfg["output"].get("seen_retention_days", 90)
+    cutoff = (dt.date.today() - dt.timedelta(days=keep)).isoformat()
+    seen = {k: v for k, v in seen.items() if v.get("first_seen", "9999") >= cutoff}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(seen, f, ensure_ascii=False, indent=1)
+
+
+# =========================================================================
+# 5) 출력 노트
+# =========================================================================
+def apply_url(item, detail=None):
+    if detail and detail.get("redirectUrl"):
+        return detail["redirectUrl"]
+    return DETAIL_PAGE.format(id=item["id"])
+
+
+def _build_match(it, rsc, detail, age, llm_out, jd_source):
+    """공고 1건의 match dict 생성(LLM 결과 유무 공통)."""
+    return {
+        "id": it["id"],
+        "company": it.get("company", {}).get("name", "?"),
+        "title": it.get("title", "?"),
+        "career": f"{it.get('careerMin','?')}~{it.get('careerMax','?')}년",
+        "region": ", ".join(it.get("regions") or []) or "-",
+        "depth": ", ".join(it.get("depthTwos") or []) or "-",
+        "age": age,
+        "url": apply_url(it, detail),
+        "jd_source": jd_source,
+        "rule": rsc,
+        "llm": llm_out["score"] if llm_out else None,
+        "score": llm_out["score"] if llm_out else rsc,
+        "verdict": llm_out.get("verdict") if llm_out else None,
+        "reasons": llm_out.get("reasons") if llm_out else None,
+        "gaps": llm_out.get("gaps") if llm_out else None,
+        "one_liner": llm_out.get("one_liner") if llm_out else None,
+        "strategy": llm_out.get("strategy") if llm_out else None,
+    }
+
+
+def write_note(cfg, matches, stats):
+    today = dt.date.today().isoformat()
+    out_dir = os.path.join(HERE, cfg["output"]["matches_dir"])
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"{today}.md")
+    minsc = cfg["output"]["min_score_in_note"]
+    notify = cfg["scoring"]["notify_threshold"]
+
+    shown = [m for m in matches if m["score"] >= minsc]
+    shown.sort(key=lambda m: m["score"], reverse=True)
+
+    lines = []
+    person = cfg.get("name", "")
+    lines.append("---")
+    lines.append(f"date: {today}")
+    lines.append("type: job-match-digest")
+    if person:
+        lines.append(f"person: {person}")
+    lines.append(f"window_days: {stats.get('window', '?')}")
+    lines.append(f"scanned: {stats['scanned']}")
+    lines.append(f"fresh: {stats['fresh']}")
+    lines.append(f"matched: {len(shown)}")
+    lines.append("tags: [job-hunt, platform]")
+    lines.append("---")
+    lines.append("")
+    title_who = f"{person} · " if person else ""
+    lines.append(f"# 🎯 {title_who}채용 플랫폼 매칭 공고 — {today}")
+    lines.append("")
+    enr = stats.get("enriched", 0)
+    enr_s = f"원본크롤 {enr}건 · " if enr else ""
+    wd = stats.get("window", "?")
+    lines.append(
+        f"> **최근 {wd}일 등록 공고** 대상 · 스캔 {stats['scanned']}건 · 규칙통과 {stats['rule_pass']}건 · "
+        f"신규 {stats['fresh']}건 · LLM평가 {stats['llm_scored']}건 · "
+        f"{enr_s}노트수록 {len(shown)}건 (점수≥{minsc})"
+    )
+    if stats.get("llm_note"):
+        lines.append(f">")
+        lines.append(f"> ⚠️ LLM 단계 생략: {stats['llm_note']} (규칙 점수만 표시)")
+    lines.append("")
+
+    if not shown:
+        lines.append("_오늘은 문턱을 넘는 신규 매칭 공고가 없어요._")
+    else:
+        lines.append("| 점수 | 판정 | 회사 | 공고 | 경력 | 지역 |")
+        lines.append("|---:|:--:|---|---|:--:|:--:|")
+        for m in shown:
+            flag = "🔥" if m["score"] >= notify else ""
+            verdict = m.get("verdict") or ("⚙️규칙만" if m.get("llm") is None else "-")
+            lines.append(
+                f"| **{m['score']}**{flag} | {verdict} | {m['company']} "
+                f"| [{m['title']}]({m['url']}) | {m['career']} | {m['region']} |"
+            )
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+        for m in shown:
+            flag = " 🔥" if m["score"] >= notify else ""
+            lines.append(f"## {m['score']}점{flag} · {m['company']} — {m['title']}")
+            lines.append("")
+            age = m.get("age")
+            age_s = f" | 등록 {age}일 전" if age is not None else ""
+            src = m.get("jd_source")
+            src_badge = {
+                "원본크롤": " · 🔎 원본 JD 크롤 반영",
+                "채용 플랫폼-빈약": " · ⚠️ 채용 플랫폼에 상세 없음(원본 링크 직접 확인 권장)",
+            }.get(src, "")
+            lines.append(f"- 🔗 [지원/공고 링크]({m['url']}){src_badge}")
+            lines.append(f"- 직무: {m['depth']} | 경력: {m['career']} | 지역: {m['region']}{age_s}")
+            lines.append(
+                f"- 규칙점수 {m['rule']}"
+                + (f" → LLM {m['llm']}" if m.get("llm") is not None else "")
+            )
+            if m.get("one_liner"):
+                lines.append(f"- 총평: {m['one_liner']}")
+            if m.get("reasons"):
+                lines.append(f"- ✅ 부합: " + " / ".join(m["reasons"]))
+            if m.get("gaps"):
+                lines.append(f"- ⚠️ 리스크: " + " / ".join(m["gaps"]))
+            # 알림문턱(기본 60) 넘는 유망 공고엔 지원·합격 전략 코멘트
+            if m["score"] >= notify and m.get("strategy"):
+                lines.append(f"- 🎯 **지원·합격 전략**")
+                for s in m["strategy"]:
+                    lines.append(f"    - {s}")
+            lines.append("")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return path, len(shown)
+
+
+# =========================================================================
+# 메인
+# =========================================================================
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--no-llm", action="store_true", help="LLM 단계 생략(규칙 점수만)")
+    ap.add_argument("--seed", action="store_true",
+                    help="알림 없이 현재 스캔 공고를 notified로 기록(첫 세팅·소음 억제용)")
+    ap.add_argument("--dry-run", action="store_true", help="노트/상태 저장 안 함")
+    ap.add_argument("--config", default="config.json",
+                    help="프로필 config 파일(다중 지원자용). 기본 config.json")
+    ap.add_argument("--days", type=int, default=None, metavar="N",
+                    help="신규로 볼 등록 경과일(createdAt 윈도우). "
+                         "지정 시 config의 new_within_days를 덮어씀. "
+                         "예: 매일 돌리면 --days 1, 3일만에 돌리면 --days 3")
+    args = ap.parse_args()
+
+    cfg = load_config(args.config)
+    person = cfg.get("name", "")
+    if person:
+        log(f"===== 프로필: {person} ({args.config}) =====")
+    profile_text = load_profile(cfg)
+    seen = load_seen(cfg)  # {id: {first_seen, created_at, age?, notified, title, rule}}
+    today = dt.date.today().isoformat()
+    window = args.days if args.days is not None else cfg["search"]["new_within_days"]
+    if args.days is not None:
+        log(f"신규 윈도우: createdAt ≤ {window}일 (--days 오버라이드)")
+    max_detail = cfg["search"]["max_detail_fetches"]
+
+    log("공고 수집 시작…")
+    listings = fetch_listings(cfg)
+    log(f"총 {len(listings)}건 수집(dedupe)")
+
+    stats = {
+        "scanned": len(listings), "rule_pass": 0, "detail_fetched": 0,
+        "fresh": 0, "llm_scored": 0, "enriched": 0, "llm_note": None,
+        "window": window,
+    }
+
+    # 규칙 프리필터 → 상세조회 후보(점수순)
+    prelim = []
+    for it in listings:
+        rid = it["id"]
+        seen.setdefault(rid, {"first_seen": today, "title": it.get("title")})
+        if title_excluded(it, cfg["filter"]):
+            continue
+        rsc, parts = rule_score(it, cfg)
+        if rsc < cfg["scoring"]["rule_threshold"] or parts["role"] == 0.0:
+            continue
+        stats["rule_pass"] += 1
+        prelim.append((it, rsc))
+    prelim.sort(key=lambda x: x[1], reverse=True)
+    log(f"규칙 통과 {stats['rule_pass']}건 → createdAt 확인")
+
+    # createdAt으로 '진짜 신규' 판정. 상세는 id당 1회만(캐시). detail 재사용.
+    fresh = []  # (it, rsc, detail, age)
+    for it, rsc in prelim:
+        rid = it["id"]
+        rec = seen[rid]
+        if rec.get("notified"):
+            continue  # 이미 알린 공고 재알림 안 함
+        detail = None
+        age = created_age_days(rec.get("created_at"))
+        if age is None:  # createdAt 아직 모름 → 상세 1회 조회
+            if stats["detail_fetched"] >= max_detail:
+                continue  # 이번 실행 상세 예산 소진(다음 실행에서 확인)
+            try:
+                detail = fetch_detail(rid)
+                stats["detail_fetched"] += 1
+            except RuntimeError as e:
+                log(f"  ! 상세 실패({rid[:8]}): {e}")
+                continue
+            rec["created_at"] = detail.get("createdAt")
+            age = created_age_days(rec.get("created_at"))
+        if age is not None and age <= window:
+            stats["fresh"] += 1
+            fresh.append((it, rsc, detail, age))
+    log(f"신규(createdAt≤{window}일) {stats['fresh']}건")
+
+    if args.seed:
+        for it, rsc, _d, _a in fresh:
+            seen[it["id"]]["notified"] = True
+        if not args.dry_run:
+            save_seen(cfg, seen)
+        log(f"--seed 완료: 신규 {stats['fresh']}건을 notified 처리. "
+            f"(총 {len(seen)} id 기록) 다음 실행부터 새 공고만 알림.")
+        return
+
+    # LLM 정밀 점수
+    engine, why = resolve_engine(cfg, args.no_llm)
+    if engine is None:
+        stats["llm_note"] = why
+        log(f"LLM 생략: {why}")
+    else:
+        log(f"LLM 엔진: {engine['provider']} ({engine['model']})")
+
+    fresh.sort(key=lambda x: x[1], reverse=True)
+    llm_budget = cfg["llm"]["max_calls_per_run"]
+    to_score = fresh[:llm_budget] if engine is not None else []
+    rest = fresh[llm_budget:] if engine is not None else fresh
+
+    # LLM 대상의 상세 확보 + base JD. 빈약하면 enrich 후보로.
+    enr_cfg = cfg.get("enrich") or {}
+    min_chars = enr_cfg.get("min_chars", 100)
+    prepared = []  # (it, rsc, detail, age, base_text, is_thin)
+    to_crawl = {}
+    for it, rsc, detail, age in to_score:
+        if detail is None:
+            detail = fetch_detail(it["id"])
+        base = detail_to_text(detail)
+        is_thin = len(base) < min_chars
+        if (enr_cfg.get("enabled") and is_thin and detail.get("redirectUrl")
+                and len(to_crawl) < enr_cfg.get("max_crawls_per_run", 15)):
+            to_crawl[it["id"]] = detail["redirectUrl"]
+        prepared.append((it, rsc, detail, age, base, is_thin))
+
+    enriched = {}
+    if to_crawl:
+        log(f"원본 크롤 시작(crawl4ai): 빈약 공고 {len(to_crawl)}건…")
+        enriched = crawl_originals(to_crawl, enr_cfg.get("page_timeout_sec", 45))
+        stats["enriched"] = len(enriched)
+        log(f"원본 확보 {len(enriched)}/{len(to_crawl)}건")
+
+    matches = []
+    for it, rsc, detail, age, base, is_thin in prepared:
+        rid = it["id"]
+        jd = enriched.get(rid) or base
+        jd_source = ("원본크롤" if rid in enriched
+                     else ("채용 플랫폼-빈약" if is_thin else "채용 플랫폼"))
+        llm_out = None
+        try:
+            llm_out = llm_score(
+                engine, cfg["llm"]["max_output_tokens"], profile_text, it, jd)
+            stats["llm_scored"] += 1
+        except Exception as e:  # noqa: BLE001
+            log(f"  ! LLM 실패({rid[:8]}): {e}")
+        matches.append(_build_match(it, rsc, detail, age, llm_out, jd_source))
+
+    # 예산 초과분: 규칙 점수만
+    for it, rsc, detail, age in rest:
+        matches.append(_build_match(it, rsc, detail, age, None,
+                                    "채용 플랫폼" if detail else None))
+
+    # 콘솔 요약
+    matches.sort(key=lambda m: m["score"], reverse=True)
+    notify = cfg["scoring"]["notify_threshold"]
+    log(f"=== 신규 매칭 (알림문턱 {notify}) ===")
+    for m in matches[:12]:
+        flag = "🔥" if m["score"] >= notify else "  "
+        log(f"  {flag} {m['score']:>5} | {m['company']} | {m['title'][:34]}")
+
+    if args.dry_run:
+        log("--dry-run: 노트/상태 저장 생략")
+        return
+
+    # 노트에 수록된 공고만 notified 처리(문턱 미만은 다음 실행에서 재평가 여지)
+    minsc = cfg["output"]["min_score_in_note"]
+    for m in matches:
+        if m["score"] >= minsc:
+            seen[m["id"]]["notified"] = True
+            seen[m["id"]]["rule"] = m["rule"]
+
+    path, n = write_note(cfg, matches, stats)
+    save_seen(cfg, seen)
+    hot = sum(1 for m in matches if m["score"] >= notify)
+    log(f"노트 작성: {path} (수록 {n}건, 🔥{hot}건)")
+
+
+if __name__ == "__main__":
+    main()

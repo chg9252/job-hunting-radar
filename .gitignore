@@ -1,0 +1,29 @@
+# ── 개인정보 (공개 리포에 절대 커밋 금지) ────────────────────
+# 실제 지원자 설정·이력·이력서 PDF·매칭 결과. 예시 템플릿(*.example.*)만 공개.
+config.json
+config.*.json
+!config.example.json
+profile.md
+profile.*.md
+!profile.example.md
+정미/
+resumes/
+matches/
+# 런타임 상태 캐시(본 공고 id·createdAt)
+state/
+
+# ── 파이썬 / 가상환경 ────────────────────────────────────────
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# ── 비밀·환경변수 ────────────────────────────────────────────
+.env
+*.key
+
+# ── OS/에디터 ────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

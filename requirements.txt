@@ -1,0 +1,9 @@
+# 규칙 기반 매칭은 표준 라이브러리만으로 동작(설치 불필요).
+
+# LLM 정밀 점수(하이브리드) — provider=api 일 때만 필요. claude_cli는 불필요.
+anthropic>=0.40
+
+# 원본 JD 크롤(enrich) — 채용 플랫폼에 상세 없는 대기업 채용페이지(toss·삼성 등) 원본을
+# 읽어 LLM에 전달. 설치 후 `crawl4ai-setup`으로 Chromium 1회 설치 필요.
+# 미설치 시 enrich 자동 생략(채용 플랫폼 빈약 본문으로 폴백).
+crawl4ai>=0.9
