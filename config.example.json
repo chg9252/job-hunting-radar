@@ -120,5 +120,14 @@
     "min_chars": 1000,
     "max_crawls_per_run": 20,
     "page_timeout_sec": 45
+  },
+  "notify": {
+    "_comment": "점수 threshold 이상 신규 매칭이 있으면 텔레그램으로 푸시. 봇 토큰은 코드/config에 저장하지 말고 환경변수(bot_token_env)로만. chat_id는 봇과 대화 시작 후 얻는 숫자 id.",
+    "telegram": {
+      "enabled": false,
+      "threshold": 50,
+      "chat_id": "",
+      "bot_token_env": "TELEGRAM_BOT_TOKEN"
+    }
   }
 }

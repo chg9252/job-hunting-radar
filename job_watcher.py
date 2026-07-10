@@ -77,6 +77,14 @@ def http_get_json(url, retries=3, pause=1.5):
     raise RuntimeError(f"GET 실패: {url} :: {last}")
 
 
+def http_post_json(url, data, timeout=15):
+    """폼 인코딩 POST → JSON 응답. 텔레그램 sendMessage 등에 사용."""
+    body = urllib.parse.urlencode(data).encode("utf-8")
+    req = urllib.request.Request(url, data=body, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
 # =========================================================================
 # 1) 수집
 # =========================================================================
@@ -565,6 +573,59 @@ def write_note(cfg, matches, stats):
 
 
 # =========================================================================
+# 6) 알림 (텔레그램 푸시)
+# =========================================================================
+def send_telegram(cfg, matches):
+    """score ≥ notify.telegram.threshold 인 매칭이 있으면 텔레그램으로 푸시.
+
+    - 봇 토큰은 **환경변수(bot_token_env, 기본 TELEGRAM_BOT_TOKEN)에서만** 읽는다.
+      (비밀이라 코드·config에 저장하지 않음)
+    - chat_id는 config.notify.telegram.chat_id 또는 env TELEGRAM_CHAT_ID.
+    - 설정/토큰/chat_id/대상 없으면 조용히 skip.
+    - matches는 이번 실행 신규(재알림 안 된) 공고만이라 중복 푸시 없음.
+    """
+    tg = (cfg.get("notify") or {}).get("telegram") or {}
+    if not tg.get("enabled"):
+        return
+    token = os.environ.get(tg.get("bot_token_env", "TELEGRAM_BOT_TOKEN"))
+    chat_id = tg.get("chat_id") or os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        log("  · 텔레그램 skip: 봇 토큰(env) 또는 chat_id 없음")
+        return
+    threshold = tg.get("threshold", 50)
+    hits = [m for m in matches if m["score"] >= threshold]
+    if not hits:
+        log(f"  · 텔레그램 skip: ≥{threshold}점 신규 없음")
+        return
+    hits.sort(key=lambda m: m["score"], reverse=True)
+    notify = cfg["scoring"]["notify_threshold"]
+    person = cfg.get("name", "")
+    who = f"{person} · " if person else ""
+    parts = [f"🎯 {who}채용 플랫폼 매칭 {len(hits)}건 (≥{threshold}점)", ""]
+    for m in hits[:10]:
+        flag = "🔥" if m["score"] >= notify else "•"
+        parts.append(f"{flag} {m['score']}점 · {m['company']} — {m['title']}")
+        if m.get("one_liner"):
+            parts.append(f"   {m['one_liner']}")
+        parts.append(f"   {m['url']}")
+        parts.append("")
+    if len(hits) > 10:
+        parts.append(f"…외 {len(hits) - 10}건. 노트에서 전체 확인.")
+    text = "\n".join(parts)[:4000]
+    try:
+        res = http_post_json(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            {"chat_id": chat_id, "text": text, "disable_web_page_preview": "true"},
+        )
+        if res.get("ok"):
+            log(f"  ✓ 텔레그램 알림 전송 ({len(hits)}건 ≥{threshold}점)")
+        else:
+            log(f"  ! 텔레그램 실패: {str(res)[:150]}")
+    except Exception as e:  # noqa: BLE001
+        log(f"  ! 텔레그램 전송 예외: {str(e)[:150]}")
+
+
+# =========================================================================
 # 메인
 # =========================================================================
 def main():
@@ -728,6 +789,7 @@ def main():
 
     path, n = write_note(cfg, matches, stats)
     save_seen(cfg, seen)
+    send_telegram(cfg, matches)
     hot = sum(1 for m in matches if m["score"] >= notify)
     log(f"노트 작성: {path} (수록 {n}건, 🔥{hot}건)")
 
