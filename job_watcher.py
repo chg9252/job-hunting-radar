@@ -109,6 +109,32 @@ def http_post_json(url, data, timeout=15):
         return json.loads(r.read().decode("utf-8"))
 
 
+def http_post_multipart(url, fields, files, timeout=60):
+    """multipart/form-data POST(파일 업로드) → JSON. 텔레그램 sendDocument용.
+
+    fields: {name: str}, files: {name: (filename, bytes, mime)}.
+    """
+    boundary = "----zw" + os.urandom(8).hex()
+    crlf = "\r\n"
+    body = b""
+    for name, val in fields.items():
+        body += (f"--{boundary}{crlf}"
+                 f'Content-Disposition: form-data; name="{name}"{crlf}{crlf}'
+                 f"{val}{crlf}").encode("utf-8")
+    for name, (fname, content, mime) in files.items():
+        body += (f"--{boundary}{crlf}"
+                 f'Content-Disposition: form-data; name="{name}"; filename="{fname}"{crlf}'
+                 f"Content-Type: {mime}{crlf}{crlf}").encode("utf-8")
+        body += content + crlf.encode("utf-8")
+    body += f"--{boundary}--{crlf}".encode("utf-8")
+    req = urllib.request.Request(url, data=body, headers={
+        "User-Agent": UA,
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
 # =========================================================================
 # 1) 수집
 # =========================================================================
@@ -599,14 +625,14 @@ def write_note(cfg, matches, stats):
 # =========================================================================
 # 6) 알림 (텔레그램 푸시)
 # =========================================================================
-def send_telegram(cfg, matches):
-    """score ≥ notify.telegram.threshold 인 매칭이 있으면 텔레그램으로 푸시.
+def send_telegram(cfg, matches, stats=None, note_path=None):
+    """score ≥ notify.telegram.threshold 인 매칭이 있으면 **노트 md 파일을 첨부**해서 푸시.
 
+    - 짧은 캡션(누구·건수·문턱·기간 + 상위 몇 건) + 노트 .md 파일 첨부(sendDocument).
+      그룹에서 파일을 탭하면 노트 전체(총평·리스크·전략·공고 링크)를 앱에서 열람.
     - 봇 토큰은 **환경변수(bot_token_env, 기본 TELEGRAM_BOT_TOKEN)에서만** 읽는다.
-      (비밀이라 코드·config에 저장하지 않음)
     - chat_id는 config.notify.telegram.chat_id 또는 env TELEGRAM_CHAT_ID.
-    - 설정/토큰/chat_id/대상 없으면 조용히 skip.
-    - matches는 이번 실행 신규(재알림 안 된) 공고만이라 중복 푸시 없음.
+    - 설정/토큰/chat_id/대상 없으면 조용히 skip. 신규(재알림 안 된) 공고만이라 중복 없음.
     """
     tg = (cfg.get("notify") or {}).get("telegram") or {}
     if not tg.get("enabled"):
@@ -625,24 +651,40 @@ def send_telegram(cfg, matches):
     notify = cfg["scoring"]["notify_threshold"]
     person = cfg.get("name", "")
     who = f"{person} · " if person else ""
-    parts = [f"🎯 {who}채용 플랫폼 매칭 {len(hits)}건 (≥{threshold}점)", ""]
-    for m in hits[:10]:
+    window = (stats or {}).get("window")
+    span = f" · 최근 {window}일" if window is not None else ""
+    lines = [f"🎯 {who}채용 플랫폼 매칭 {len(hits)}건 (≥{threshold}점{span})"]
+    for m in hits[:8]:
         flag = "🔥" if m["score"] >= notify else "•"
-        parts.append(f"{flag} {m['score']}점 · {m['company']} — {m['title']}")
-        if m.get("one_liner"):
-            parts.append(f"   {m['one_liner']}")
-        parts.append(f"   {m['url']}")
-        parts.append("")
-    if len(hits) > 10:
-        parts.append(f"…외 {len(hits) - 10}건. 노트에서 전체 확인.")
-    text = "\n".join(parts)[:4000]
+        lines.append(f"{flag} {m['score']}점 · {m['company']} — {m['title']}")
+    if len(hits) > 8:
+        lines.append(f"…외 {len(hits) - 8}건")
+    lines.append("📄 전체 상세·전략·공고링크는 첨부 노트 ↓")
+    caption = "\n".join(lines)[:1024]
+
+    # 노트 md 파일을 문서로 첨부. 파일 못 읽으면 캡션만 텍스트로 폴백.
+    doc = None
+    if note_path and os.path.isfile(note_path):
+        try:
+            with open(note_path, "rb") as f:
+                doc = (os.path.basename(note_path), f.read(), "text/markdown")
+        except Exception:  # noqa: BLE001
+            doc = None
     try:
-        res = http_post_json(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            {"chat_id": chat_id, "text": text, "disable_web_page_preview": "true"},
-        )
+        if doc:
+            res = http_post_multipart(
+                f"https://api.telegram.org/bot{token}/sendDocument",
+                {"chat_id": str(chat_id), "caption": caption},
+                {"document": doc},
+            )
+        else:
+            res = http_post_json(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                {"chat_id": chat_id, "text": caption, "disable_web_page_preview": "true"},
+            )
         if res.get("ok"):
-            log(f"  ✓ 텔레그램 알림 전송 ({len(hits)}건 ≥{threshold}점)")
+            log(f"  ✓ 텔레그램 알림 전송 ({len(hits)}건 ≥{threshold}점"
+                + (", 노트 첨부)" if doc else ")"))
         else:
             log(f"  ! 텔레그램 실패: {str(res)[:150]}")
     except Exception as e:  # noqa: BLE001
@@ -845,7 +887,7 @@ def main():
 
     path, n = write_note(cfg, matches, stats)
     save_seen(cfg, seen)
-    send_telegram(cfg, matches)
+    send_telegram(cfg, matches, stats, path)
     hot = sum(1 for m in matches if m["score"] >= notify)
     log(f"노트 작성: {path} (수록 {n}건, 🔥{hot}건)")
 
