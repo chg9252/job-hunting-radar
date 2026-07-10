@@ -48,6 +48,30 @@ def log(msg):
     print(f"[{dt.datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def load_dotenv(path=None):
+    """스크립트 폴더의 .env를 읽어 os.environ에 주입(이미 있는 값은 안 덮음).
+
+    python-dotenv 없이 표준 라이브러리만으로 동작. 파일 없으면 조용히 통과.
+    형식: KEY=VALUE (한 줄에 하나, # 주석·빈 줄 무시, 따옴표 자동 제거).
+    """
+    path = path or os.path.join(HERE, ".env")
+    if not os.path.isfile(path):
+        return
+    try:
+        with open(path, encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = val
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def load_config(path="config.json"):
     if not os.path.isabs(path):
         path = os.path.join(HERE, path)
@@ -670,6 +694,7 @@ def main():
                     help="텔레그램 설정 확인용 테스트 메시지 1건 전송 후 종료")
     args = ap.parse_args()
 
+    load_dotenv()  # .env(있으면)의 TELEGRAM_BOT_TOKEN 등 주입
     cfg = load_config(args.config)
     if args.test_telegram:
         telegram_test(cfg)
