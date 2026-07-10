@@ -625,6 +625,32 @@ def send_telegram(cfg, matches):
         log(f"  ! 텔레그램 전송 예외: {str(e)[:150]}")
 
 
+def telegram_test(cfg):
+    """--test-telegram: 봇 토큰(env)+chat_id 설정이 맞는지 테스트 메시지 1건 전송."""
+    tg = (cfg.get("notify") or {}).get("telegram") or {}
+    token = os.environ.get(tg.get("bot_token_env", "TELEGRAM_BOT_TOKEN"))
+    chat_id = tg.get("chat_id") or os.environ.get("TELEGRAM_CHAT_ID")
+    if not token:
+        log("텔레그램 테스트 실패: 봇 토큰 환경변수 없음. "
+            "setx 후 '새 터미널'에서 다시 실행하세요.")
+        return
+    if not chat_id:
+        log("텔레그램 테스트 실패: config.notify.telegram.chat_id 가 비어있음.")
+        return
+    try:
+        res = http_post_json(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            {"chat_id": chat_id,
+             "text": "✅ job-hunting-radar 텔레그램 연결 OK. 이제 ≥50점 신규 매칭이 여기로 옵니다."},
+        )
+        if res.get("ok"):
+            log(f"텔레그램 테스트 전송 성공 → chat_id {chat_id}. 앱에서 메시지 확인하세요.")
+        else:
+            log(f"텔레그램 테스트 실패: {str(res)[:200]}")
+    except Exception as e:  # noqa: BLE001
+        log(f"텔레그램 테스트 예외: {str(e)[:200]}")
+
+
 # =========================================================================
 # 메인
 # =========================================================================
@@ -640,9 +666,14 @@ def main():
                     help="신규로 볼 등록 경과일(createdAt 윈도우). "
                          "지정 시 config의 new_within_days를 덮어씀. "
                          "예: 매일 돌리면 --days 1, 3일만에 돌리면 --days 3")
+    ap.add_argument("--test-telegram", action="store_true",
+                    help="텔레그램 설정 확인용 테스트 메시지 1건 전송 후 종료")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+    if args.test_telegram:
+        telegram_test(cfg)
+        return
     person = cfg.get("name", "")
     if person:
         log(f"===== 프로필: {person} ({args.config}) =====")
