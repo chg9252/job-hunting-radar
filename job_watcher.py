@@ -580,7 +580,7 @@ def write_note(cfg, matches, stats):
         lines.append("|---:|:--:|---|---|:--:|:--:|")
         for m in shown:
             flag = "🔥" if m["score"] >= notify else ""
-            verdict = m.get("verdict") or ("⚙️규칙만" if m.get("llm") is None else "-")
+            verdict = m.get("verdict") or ("⚙️ LLM 미검증" if m.get("llm") is None else "-")
             lines.append(
                 f"| **{m['score']}**{flag} | {verdict} | {m['company']} "
                 f"| [{m['title']}]({m['url']}) | {m['career']} | {m['region']} |"

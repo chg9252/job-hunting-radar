@@ -115,7 +115,7 @@ export ANTHROPIC_API_KEY="sk-ant-..."   # Windows: setx ANTHROPIC_API_KEY "..."
 
 ### 공통
 
-- `llm.max_calls_per_run`이 1회 실행 채점 상한. 초과분은 규칙 점수만 매겨 노트에 `⚙️규칙만` 표시.
+- `llm.max_calls_per_run`이 1회 실행 채점 상한. 초과분은 규칙 점수만 매겨 노트에 `⚙️ LLM 미검증` 표시(LLM이 안 본 공고 = 규칙 점수만, 신뢰도 낮음).
 - 어느 방식도 준비 안 되면 노트 상단에 "LLM 생략" 배너가 뜨고 규칙 점수로만 채운다.
 
 ## 원본 JD 크롤 (enrich)
