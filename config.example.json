@@ -115,7 +115,7 @@
     "seen_retention_days": 90
   },
   "enrich": {
-    "_comment": "채용 플랫폼 본문이 min_chars 미만이면 원본(redirectUrl)을 crawl4ai로 크롤해 실제 JD를 LLM에 전달. 실패 시 폴백. crawl4ai 미설치면 자동 생략.",
+    "_comment": "플랫폼 본문이 min_chars 미만이면 원본(redirectUrl)을 crawl4ai로 크롤해 실제 JD를 LLM에 전달. 실패 시 폴백. crawl4ai 미설치면 자동 생략.",
     "enabled": true,
     "min_chars": 1000,
     "max_crawls_per_run": 20,

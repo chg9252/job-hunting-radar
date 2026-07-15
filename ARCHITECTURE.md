@@ -4,15 +4,15 @@
 
 ```mermaid
 flowchart TD
-    CFG["⚙️ config.{name}.json<br/>채용 플랫폼 필터 조건·가중치·문턱"]:::cfg
+    CFG["⚙️ config.{name}.json<br/>플랫폼 필터 조건·가중치·문턱"]:::cfg
     PROF["📄 profile.{name}.md<br/>이력 요약(LLM 입력)"]:::cfg
     RUN["⏰ run.bat<br/>작업 스케줄러 (하루 N회)"]:::sched
 
     RUN --> S1
     CFG --> S1
 
-    S1["① 수집 · fetch_listings<br/>채용 플랫폼 필터를 서버단 쿼리로 변환"]:::step
-    APIL[("채용 플랫폼 공개 API<br/>api.example.com/recruitments")]:::api
+    S1["① 수집 · fetch_listings<br/>플랫폼 필터를 서버단 쿼리로 변환"]:::step
+    APIL[("채용 플랫폼 공개 API<br/>베이스는 .env PLATFORM_API_BASE")]:::api
     S1 -->|"depthTwos·regions·career·<br/>employeeTypes·educations·companyTypes"| APIL
     APIL -->|"필터 유니버스 전체<br/>페이지네이션 dedupe"| S2
 
@@ -24,12 +24,12 @@ flowchart TD
     S3 -->|"id당 1회만 조회 후 캐시"| APID
     S3 -->|"이미 notified면 제외<br/>= 진짜 신규만"| SE
 
-    SE["③-b enrich · crawl_originals<br/>채용 플랫폼 본문 빈약(&lt;min_chars)이면<br/>원본을 crawl4ai로 크롤"]:::step
+    SE["③-b enrich · crawl_originals<br/>플랫폼 본문 빈약(&lt;min_chars)이면<br/>원본을 crawl4ai로 크롤"]:::step
     CR[["🕷️ crawl4ai (로컬 헤드리스)<br/>기업 자체 SPA 렌더링 → JD 마크다운"]]:::llm
     SE <-->|"redirectUrl 원본 JD<br/>실패 시 폴백(⚠️ 표시)"| CR
     SE --> S4
 
-    S4["④ LLM 정밀 채점 · llm_score<br/>이력 ↔ (원본 or 채용 플랫폼) JD 대조"]:::step
+    S4["④ LLM 정밀 채점 · llm_score<br/>이력 ↔ (원본 or 플랫폼) JD 대조"]:::step
     PROF --> S4
     LLM[["🤖 Claude (sonnet)<br/>claude -p 헤드리스 = 구독 채점"]]:::llm
     S4 <-->|"score·verdict·근거·리스크·전략"| LLM
@@ -55,17 +55,17 @@ flowchart TD
 
 | 단계 | 하는 일 | 핵심 포인트 |
 |---|---|---|
-| ① 수집 | 채용 플랫폼 필터 = API 파라미터로 변환해 유니버스 전체를 긁음 | 사이트에서 건 필터와 **동일 집합**. 소량이라 통째로 수집 |
+| ① 수집 | 플랫폼 필터 = API 파라미터로 변환해 유니버스 전체를 긁음 | 사이트에서 건 필터와 **동일 집합**. 소량이라 통째로 수집 |
 | ② 규칙 점수 | 직무/경력/기술/지역/고용형태 가중합 | 값싼 프리필터. 문턱 미달·비대상 컷 |
 | ③ 신규 판정 | 상세의 `createdAt`이 N일 이내만 | 페이지네이션 불안정 무관. 상세는 **id당 1회** 조회·캐시 |
-| ③-b enrich | 채용 플랫폼 본문 빈약하면 원본을 crawl4ai로 크롤 | 기업 자체페이지 JD 확보. 실패 시 폴백 |
-| ④ LLM 채점 | 이력 ↔ (원본/채용 플랫폼) JD 정밀 대조 | 구독(`claude -p`) 또는 API로 채점. 근거·리스크·**전략** 생성 |
+| ③-b enrich | 플랫폼 본문 빈약하면 원본을 crawl4ai로 크롤 | 기업 자체페이지 JD 확보. 실패 시 폴백 |
+| ④ LLM 채점 | 이력 ↔ (원본/플랫폼) JD 정밀 대조 | 구독(`claude -p`) 또는 API로 채점. 근거·리스크·**전략** 생성 |
 | ⑤ 출력 | 노트 작성 + 상태 저장 | 문턱↑ 🔥+전략, notified로 재알림 방지 |
 
 ## 데이터 상태 (state/{name}.json)
 
 ```
-{ "<공고id>": { "first_seen": "날짜", "created_at": "채용 플랫폼 등록시각",
+{ "<공고id>": { "first_seen": "날짜", "created_at": "플랫폼 등록시각",
                 "notified": true, "rule": 80.0, "title": "..." } }
 ```
 
@@ -74,6 +74,6 @@ flowchart TD
 
 ## 왜 이렇게(하이브리드 + createdAt) 설계했나
 
-- **채용 플랫폼 API가 안정적 최신순 목록을 안 줌** → 단순 diff는 가짜 신규 폭증 → `createdAt`으로 판정.
+- **플랫폼 API가 안정적 최신순 목록을 안 줌** → 단순 diff는 가짜 신규 폭증 → `createdAt`으로 판정.
 - **규칙만으론 변별력 부족**(제목·카테고리만 봄) → 신규 소수만 LLM이 JD까지 읽어 정밀 채점.
 - **비용 통제**: 값싼 규칙으로 좁히고, 진짜 신규(하루 몇 건)만 LLM. 상세도 신규만 조회.

@@ -1,20 +1,21 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-platform_watcher — 채용 플랫폼(platform.com) 채용 공고를 내 이력에 대입해 매칭 공고를 알려주는 워처.
+job_watcher — 채용 플랫폼의 공고를 내 이력에 대입해 매칭 공고를 알려주는 워처.
 
 파이프라인:
-  1) 공개 API(https://api.example.com/api/recruitments)에서 keyword별로 공고 목록 수집
+  1) 채용 플랫폼 공개 API(베이스는 .env의 PLATFORM_API_BASE)에서 keyword별로 공고 목록 수집
   2) 직무(depthTwos)·경력·지역으로 규칙 기반 프리필터 + 점수화
   3) 이전 실행에서 본 id와 diff → "새로 뜬" 공고만 추림
   4) 규칙 문턱 통과 + 신규 공고만 상세 API 조회 → LLM(Claude)이 이력서와 정밀 대조해 재점수
   5) Obsidian 노트(matches/YYYY-MM-DD.md)로 매칭 다이제스트 출력 + 본 id 저장
 
+크롤 대상(플랫폼명·API 베이스)은 코드에 두지 않고 .env로만 주입한다(.env.example 참고).
 의존성: 표준 라이브러리만으로 규칙 기반 동작. LLM 단계는 `anthropic` + ANTHROPIC_API_KEY 있을 때만.
-사용법:  python platform_watcher.py           (전체 실행)
-         python platform_watcher.py --no-llm  (규칙 점수만)
-         python platform_watcher.py --seed    (알림 없이 현재 공고를 seen에 기록만, 첫 세팅용)
-         python platform_watcher.py --dry-run (노트/상태 저장 안 함, 콘솔 출력만)
+사용법:  python job_watcher.py           (전체 실행)
+         python job_watcher.py --no-llm  (규칙 점수만)
+         python job_watcher.py --seed    (알림 없이 현재 공고를 seen에 기록만, 첫 세팅용)
+         python job_watcher.py --dry-run (노트/상태 저장 안 함, 콘솔 출력만)
 """
 
 import argparse
@@ -35,10 +36,6 @@ except Exception:
     pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-API_LIST = "https://api.example.com/api/recruitments"
-API_DETAIL = "https://api.example.com/api/recruitments/{id}"
-DETAIL_PAGE = "https://platform.com/recruitment/{id}"
-UA = "Mozilla/5.0 (platform-watcher; personal job-match tool)"
 
 
 # =========================================================================
@@ -70,6 +67,17 @@ def load_dotenv(path=None):
                     os.environ[key] = val
     except Exception:  # noqa: BLE001
         pass
+
+
+# 크롤 대상은 코드에 하드코딩하지 않는다. .env(PLATFORM_*)에서만 읽는다(.env.example 참고).
+load_dotenv()  # import 시점에 .env 주입 → 아래 엔드포인트/키가 채워짐
+PLATFORM_NAME = os.getenv("PLATFORM_NAME", "채용 플랫폼")
+_API_BASE = (os.getenv("PLATFORM_API_BASE") or "").rstrip("/")
+_SITE_BASE = (os.getenv("PLATFORM_SITE_BASE") or "").rstrip("/")
+API_LIST = f"{_API_BASE}/api/recruitments"
+API_DETAIL = f"{_API_BASE}/api/recruitments/{{id}}"
+DETAIL_PAGE = f"{_SITE_BASE}/recruitment/{{id}}"
+UA = os.getenv("PLATFORM_UA", "Mozilla/5.0 (job-watcher; personal job-match tool)")
 
 
 def load_config(path="config.json"):
@@ -145,7 +153,7 @@ _SCALAR_FILTER_KEYS = ("careerMin", "careerMax")
 
 
 def build_filter_qs(filters):
-    """config search.filters → 채용 플랫폼 필터 쿼리스트링. 빈 값은 생략(= 전체)."""
+    """config search.filters → 플랫폼 필터 쿼리스트링. 빈 값은 생략(= 전체)."""
     parts = []
     for key in _LIST_FILTER_KEYS:
         for v in filters.get(key) or []:
@@ -157,7 +165,10 @@ def build_filter_qs(filters):
 
 
 def fetch_listings(cfg):
-    """채용 플랫폼 필터(서버단) + 선택적 keyword로 페이지를 긁어 id 기준 dedupe."""
+    """플랫폼 필터(서버단) + 선택적 keyword로 페이지를 긁어 id 기준 dedupe."""
+    if not _API_BASE:
+        raise SystemExit(
+            "PLATFORM_API_BASE 미설정: .env에 크롤 대상 API 베이스를 넣으세요 (.env.example 참고).")
     s = cfg["search"]
     fqs = build_filter_qs(s.get("filters") or {})
     max_pages = s.get("max_pages", s.get("pages_per_keyword", 8))
@@ -228,7 +239,7 @@ def detail_to_text(detail):
 
 
 # =========================================================================
-# 1-b) enrich: 채용 플랫폼 본문이 빈약하면 원본(채용사이트·기업 채용페이지)을 crawl4ai로 크롤
+# 1-b) enrich: 플랫폼 본문이 빈약하면 원본(기업 채용페이지)을 crawl4ai로 크롤
 # =========================================================================
 def crawl_originals(url_by_id, page_timeout_sec=45):
     """{id: redirectUrl} → {id: 정제 JD 마크다운}. crawl4ai(로컬 헤드리스)로 SPA 렌더링.
@@ -454,7 +465,7 @@ def _score_api(engine, max_tokens, prompt):
 
 # claude CLI를 볼트 밖 중립 폴더에서 실행 → 볼트 CLAUDE.md/스킬 미로드로 오버헤드 감소
 import tempfile  # noqa: E402
-CLI_CWD = os.path.join(tempfile.gettempdir(), "platform_watcher_cli")
+CLI_CWD = os.path.join(tempfile.gettempdir(), "job_watcher_cli")
 
 
 def _score_cli(engine, max_tokens, prompt):
@@ -583,11 +594,11 @@ def write_note(cfg, matches, stats):
     lines.append(f"scanned: {stats['scanned']}")
     lines.append(f"fresh: {stats['fresh']}")
     lines.append(f"matched: {len(shown)}")
-    lines.append("tags: [job-hunt, platform]")
+    lines.append("tags: [job-hunt]")
     lines.append("---")
     lines.append("")
     title_who = f"{person} · " if person else ""
-    lines.append(f"# 🎯 {title_who}채용 플랫폼 매칭 공고 — {today}")
+    lines.append(f"# 🎯 {title_who}{PLATFORM_NAME} 매칭 공고 — {today}")
     lines.append("")
     enr = stats.get("enriched", 0)
     enr_s = f"원본크롤 {enr}건 · " if enr else ""
@@ -628,7 +639,7 @@ def write_note(cfg, matches, stats):
             src = m.get("jd_source")
             src_badge = {
                 "원본크롤": " · 🔎 원본 JD 크롤 반영",
-                "채용 플랫폼-빈약": " · ⚠️ 채용 플랫폼에 상세 없음(원본 링크 직접 확인 권장)",
+                "thin": " · ⚠️ 상세 없음(원본 링크 직접 확인 권장)",
             }.get(src, "")
             lines.append(f"- 🔗 [지원/공고 링크]({m['url']}){src_badge}")
             lines.append(f"- 직무: {m['depth']} | 경력: {m['career']} | 지역: {m['region']}{age_s}")
@@ -661,7 +672,7 @@ def write_note(cfg, matches, stats):
 # =========================================================================
 _DASH_TEMPLATE = """<meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>__PERSON__ · 채용 플랫폼 매칭 대시보드</title>
+<title>__PERSON__ · 채용 매칭 대시보드</title>
 <style>
   :root{color-scheme:light}
   *{box-sizing:border-box}
@@ -692,7 +703,7 @@ _DASH_TEMPLATE = """<meta charset="utf-8">
   .empty{padding:30px;text-align:center;color:#98a5b3}
 </style>
 <div class="wrap">
-  <h1>🎯 __PERSON__ · 채용 플랫폼 매칭 대시보드</h1>
+  <h1>🎯 __PERSON__ · 채용 매칭 대시보드</h1>
   <div class="meta">생성 __GEN__ · 총 <b>__TOTAL__</b>건 · 🔥 __HOT__건 · ⏰ 마감임박 __URGENT__건 · 알림문턱 __NOTIFY__점</div>
   <div class="ctrl">
     <input id="q" placeholder="회사·공고 검색…">
@@ -837,7 +848,7 @@ def send_telegram(cfg, matches, stats=None, note_path=None):
     who = f"{person} · " if person else ""
     window = (stats or {}).get("window")
     span = f" · 최근 {window}일" if window is not None else ""
-    lines = [f"🎯 {who}채용 플랫폼 매칭 {len(hits)}건 (≥{threshold}점{span})"]
+    lines = [f"🎯 {who}{PLATFORM_NAME} 매칭 {len(hits)}건 (≥{threshold}점{span})"]
     for m in hits[:8]:
         flag = "🔥" if m["score"] >= notify else "•"
         lines.append(f"{flag} {m['score']}점 · {m['company']} — {m['title']}")
@@ -1035,7 +1046,7 @@ def main():
         rid = it["id"]
         jd = enriched.get(rid) or base
         jd_source = ("원본크롤" if rid in enriched
-                     else ("채용 플랫폼-빈약" if is_thin else "채용 플랫폼"))
+                     else ("thin" if is_thin else "platform"))
         llm_out = None
         try:
             llm_out = llm_score(
@@ -1048,7 +1059,7 @@ def main():
     # 예산 초과분: 규칙 점수만
     for it, rsc, detail, age in rest:
         matches.append(_build_match(it, rsc, detail, age, None,
-                                    "채용 플랫폼" if detail else None))
+                                    "platform" if detail else None))
 
     # 콘솔 요약
     matches.sort(key=lambda m: m["score"], reverse=True)

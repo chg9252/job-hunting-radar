@@ -3,7 +3,7 @@ chcp 65001 >nul
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
-REM platform-watcher launcher (runs all profiles in order).
+REM job-watcher launcher (runs all profiles in order).
 REM   - Double-click (no args): asks how many days back (Enter = 3).
 REM   - With args (e.g. Task Scheduler): runs directly, no prompt.
 REM       run.bat --days 1    (daily)
@@ -27,8 +27,8 @@ if "%ARGS%"=="" (
 echo.
 echo [run] options: !ARGS!
 echo.
-"%PY%" platform_watcher.py --config config.json !ARGS!
-"%PY%" platform_watcher.py --config config.jungmi.json !ARGS!
+"%PY%" job_watcher.py --config config.json !ARGS!
+"%PY%" job_watcher.py --config config.other.json !ARGS!
 
 REM Keep the window open only for double-click (no args). Scheduler just exits.
 if "%~1"=="" pause

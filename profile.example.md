@@ -1,7 +1,7 @@
 # 지원자 프로필 (LLM 매칭용 요약)
 
 > 이 파일을 `profile.md` 로 복사한 뒤 본인 이력으로 고치세요. (profile.md 는 .gitignore 됨)
-> platform_watcher.py 가 공고와 대조할 때 LLM 프롬프트에 넣는 이력 요약이다.
+> job_watcher.py 가 공고와 대조할 때 LLM 프롬프트에 넣는 이력 요약이다.
 > 자유 형식이지만, 아래처럼 "한 줄 → 경력 → 기술스택 → 선호조건 → 감점요인" 순이면 LLM이 잘 읽는다.
 
 ## 한 줄
