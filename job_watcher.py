@@ -79,6 +79,17 @@ API_DETAIL = f"{_API_BASE}/api/recruitments/{{id}}"
 DETAIL_PAGE = f"{_SITE_BASE}/recruitment/{{id}}"
 UA = os.getenv("PLATFORM_UA", "Mozilla/5.0 (job-watcher; personal job-match tool)")
 
+# 2번째 소스(2차 소스)도 대상명을 코드에 두지 않고 .env로만 주입.
+PLATFORM_B_API_BASE = (os.getenv("PLATFORM_B_API_BASE") or "").rstrip("/")
+PLATFORM_B_SITE_BASE = (os.getenv("PLATFORM_B_SITE_BASE") or "").rstrip("/")
+PLATFORM_B_NAME = os.getenv("PLATFORM_B_NAME", "소스B")
+_SOURCE_LABEL = {"platform": PLATFORM_NAME, "platform_b": PLATFORM_B_NAME}
+
+
+def source_badge(sources):
+    """공고 출처 배지. 표시명은 .env에서 옴(코드에 대상명 없음)."""
+    return " ".join("🔹" + _SOURCE_LABEL.get(s, s) for s in (sources or []))
+
 
 def load_config(path="config.json"):
     if not os.path.isabs(path):
@@ -164,15 +175,20 @@ def build_filter_qs(filters):
     return "&".join(parts)
 
 
-def fetch_listings(cfg):
-    """플랫폼 필터(서버단) + 선택적 keyword로 페이지를 긁어 id 기준 dedupe."""
+def _iter_source_configs(cfg):
+    """config.sources[](enabled만) 또는 레거시 단일 search를 1차 소스로 매핑(하위호환)."""
+    if cfg.get("sources"):
+        return [s for s in cfg["sources"] if s.get("enabled", True)]
+    return [{"type": "platform", "search": cfg.get("search", {})}]
+
+
+def _fetch_platform(s):
+    """1차 소스: 서버단 필터 + 선택 keyword로 페이지 수집, id dedupe. _source 태깅."""
     if not _API_BASE:
         raise SystemExit(
             "PLATFORM_API_BASE 미설정: .env에 크롤 대상 API 베이스를 넣으세요 (.env.example 참고).")
-    s = cfg["search"]
     fqs = build_filter_qs(s.get("filters") or {})
     max_pages = s.get("max_pages", s.get("pages_per_keyword", 8))
-    # keywords 있으면 각 키워드로 추가 검색, 없으면 필터만으로 1회 순회
     keywords = s.get("keywords") or [None]
     by_id = {}
     for kw in keywords:
@@ -188,21 +204,160 @@ def fetch_listings(cfg):
             try:
                 data = http_get_json(url).get("data") or {}
             except RuntimeError as e:
-                log(f"  ! '{label}' p{pg} 수집 실패: {e}")
+                log(f"  ! [{PLATFORM_NAME}] '{label}' p{pg} 수집 실패: {e}")
                 break
             total = data.get("totalElements", total)
             content = data.get("content") or []
             for it in content:
+                it["_source"] = "platform"
                 by_id[it["id"]] = it
             if data.get("last") or not content:
                 break
-        log(f"  · '{label}' 필터 대상 {total}건 → 누적 수집 {len(by_id)}건")
+        log(f"  · [{PLATFORM_NAME}] '{label}' 대상 {total}건 → 누적 {len(by_id)}건")
+    return list(by_id.values())
+
+
+def _native_deadline(raw):
+    """2차 소스 closedAt/alwaysOpen → 공통 deadline(YYYY-MM-DD | '상시' | None)."""
+    if raw.get("alwaysOpen"):
+        return "상시"
+    c = raw.get("closedAt")
+    return str(c)[:10] if c else None
+
+
+def _fetch_platform_b(s, role_primary):
+    """2차 소스: 서버단 필터로 positions 수집 → 공통(공통(1차형)) item으로 정규화.
+
+    목록에 closedAt(마감)·경력·지역·스택이 있어 마감일을 네이티브로 확보(LLM 추출 불필요).
+    등록일(publishedAt)은 목록에 없어 상세에서 확인(신규판정 시).
+    """
+    if not PLATFORM_B_API_BASE:
+        log(f"  · [{PLATFORM_B_NAME}] PLATFORM_B_API_BASE 미설정 → 건너뜀")
+        return []
+    cats = s.get("job_categories") or []
+    max_pages = s.get("max_pages", 5)
+    size = s.get("page_size", 50)
+    sort = s.get("sort", "relation")
+    by_id = {}
+    cat_params = [f"jobCategory={urllib.parse.quote(str(c))}" for c in cats] or [None]
+    for cp in cat_params:
+        for pg in range(max_pages):
+            bits = [f"page={pg}", f"size={size}", f"sort={sort}"]
+            if cp:
+                bits.append(cp)
+            url = f"{PLATFORM_B_API_BASE}/api/positions?" + "&".join(b for b in bits if b)
+            try:
+                res = http_get_json(url).get("result") or {}
+            except RuntimeError as e:
+                log(f"  ! [{PLATFORM_B_NAME}] p{pg} 수집 실패: {e}")
+                break
+            positions = res.get("positions") or []
+            for p in positions:
+                rid = str(p.get("id"))
+                by_id[rid] = {
+                    "id": rid,
+                    "_source": "platform_b",
+                    "title": p.get("title") or "?",
+                    "company": {"name": p.get("companyName") or "?"},
+                    "careerMin": p.get("minCareer"),
+                    "careerMax": p.get("maxCareer"),
+                    "regions": p.get("locations") or [],
+                    "employeeTypes": [],
+                    # 서버단 직무 카테고리로 이미 필터됨 → 역할 점수는 주력으로 취급
+                    "depthTwos": list(role_primary),
+                    "depthOnes": [],
+                    "_deadline": _native_deadline(p),
+                }
+            if res.get("emptyPosition") or not positions:
+                break
+        log(f"  · [{PLATFORM_B_NAME}] cat={cp or '(전체)'} → 누적 {len(by_id)}건")
     return list(by_id.values())
 
 
 def fetch_detail(rid):
     data = http_get_json(API_DETAIL.format(id=rid)).get("data") or {}
     return data
+
+
+def _platform_b_detail(raw_id):
+    """2차 소스 상세 → 공통(1차형) detail dict(createdAt=publishedAt, _jd_text=구조화 JD, redirectUrl=공고페이지)."""
+    d = http_get_json(f"{PLATFORM_B_API_BASE}/api/position/{raw_id}").get("result") or {}
+    parts = []
+    for k in ("responsibility", "qualifications", "preferredRequirements", "welfares"):
+        if d.get(k):
+            parts.append(f"[{k}]\n{d[k]}")
+    # techStacks는 목록에선 문자열, 상세에선 dict({name:...}) 배열일 수 있어 방어.
+    stacks = [s.get("name") if isinstance(s, dict) else s for s in (d.get("techStacks") or [])]
+    stacks = [s for s in stacks if s]
+    if stacks:
+        parts.append("[기술스택] " + ", ".join(stacks))
+    page = f"{PLATFORM_B_SITE_BASE}/position/{raw_id}" if PLATFORM_B_SITE_BASE else None
+    return {
+        "createdAt": d.get("publishedAt"),
+        "_jd_text": "\n\n".join(parts).strip(),
+        "redirectUrl": page,
+        "_deadline": _native_deadline(d),
+    }
+
+
+def fetch_detail_for(item):
+    """소스별 상세 조회 → 공통 detail dict로 dispatch."""
+    if item.get("_source") == "platform_b":
+        return _platform_b_detail(item["id"])
+    return fetch_detail(item["id"])
+
+
+def _norm_key(item):
+    """dedup 키: 회사명 + 제목 정규화(괄호·공백·기호 제거, 소문자)."""
+    comp = (item.get("company", {}) or {}).get("name", "")
+    title = re.sub(r"\(.*?\)", "", item.get("title", ""))
+    t = re.sub(r"[\s\W_]+", "", title).lower()
+    c = re.sub(r"[\s\W_]+", "", comp).lower()
+    return f"{c}|{t}"
+
+
+def _dedup(items):
+    """소스 '간' 중복(회사+제목)만 병합. 같은 소스 내 항목은 이미 id로 구분되므로 그대로 유지.
+
+    병합 시 마감일 있는 소스(2차 소스 closedAt) 정보를 본체로, 양쪽 소스 배지 기록.
+    """
+    out = []
+    idx = {}  # norm_key -> out 인덱스
+    for it in items:
+        it.setdefault("_sources", [it.get("_source", "?")])
+        k = _norm_key(it)
+        j = idx.get(k)
+        if j is not None and it.get("_source") not in out[j]["_sources"]:
+            keep = out[j]
+            merged = list(dict.fromkeys(keep["_sources"] + it["_sources"]))
+            if not keep.get("_deadline") and it.get("_deadline"):
+                it["_sources"] = merged      # 마감일 있는 쪽을 본체로 교체
+                out[j] = it
+            else:
+                keep["_sources"] = merged
+            continue
+        out.append(it)
+        idx[k] = len(out) - 1
+    return out
+
+
+def fetch_listings(cfg):
+    """활성 소스 전체를 수집·정규화 후 소스 간 중복 병합."""
+    items = []
+    for sc in _iter_source_configs(cfg):
+        t = sc.get("type", "platform")
+        if t == "platform":
+            items += _fetch_platform(sc.get("search") or cfg.get("search", {}))
+        elif t == "platform_b":
+            items += _fetch_platform_b(sc.get("search") or {},
+                                   cfg.get("filter", {}).get("primary_depth_twos", []))
+        else:
+            log(f"  ! 알 수 없는 소스 type: {t} (건너뜀)")
+    before = len(items)
+    merged = _dedup(items)
+    if before != len(merged):
+        log(f"  · 소스 간 중복 병합: {before} → {len(merged)}건")
+    return merged
 
 
 def flatten_content(node, out):
@@ -229,6 +384,8 @@ def created_age_days(created_at):
 
 
 def detail_to_text(detail):
+    if detail.get("_jd_text"):  # 소스가 구조화 JD를 직접 제공(2차 소스 등)
+        return detail["_jd_text"]
     parts = []
     flatten_content(detail.get("content"), parts)
     body = " ".join(parts)
@@ -521,6 +678,8 @@ def save_seen(cfg, seen):
 def apply_url(item, detail=None):
     if detail and detail.get("redirectUrl"):
         return detail["redirectUrl"]
+    if item.get("_source") == "platform_b":
+        return f"{PLATFORM_B_SITE_BASE}/position/{item['id']}" if PLATFORM_B_SITE_BASE else "#"
     return DETAIL_PAGE.format(id=item["id"])
 
 
@@ -536,6 +695,7 @@ def _build_match(it, rsc, detail, age, llm_out, jd_source):
         "age": age,
         "url": apply_url(it, detail),
         "jd_source": jd_source,
+        "sources": it.get("_sources") or [it.get("_source", "platform")],
         "rule": rsc,
         "llm": llm_out["score"] if llm_out else None,
         "score": llm_out["score"] if llm_out else rsc,
@@ -543,7 +703,8 @@ def _build_match(it, rsc, detail, age, llm_out, jd_source):
         "reasons": llm_out.get("reasons") if llm_out else None,
         "gaps": llm_out.get("gaps") if llm_out else None,
         "one_liner": llm_out.get("one_liner") if llm_out else None,
-        "deadline": llm_out.get("deadline") if llm_out else None,
+        # 마감일: 소스가 네이티브로 주면(2차 소스 closedAt) 그걸 우선, 없으면 LLM 추출값.
+        "deadline": it.get("_deadline") or (llm_out.get("deadline") if llm_out else None),
         "strategy": llm_out.get("strategy") if llm_out else None,
     }
 
@@ -632,7 +793,9 @@ def write_note(cfg, matches, stats):
         lines.append("")
         for m in shown:
             flag = " 🔥" if m["score"] >= notify else ""
-            lines.append(f"## {m['score']}점{flag} · {m['company']} — {m['title']}")
+            sb = source_badge(m.get("sources"))
+            sb = f"  {sb}" if sb else ""
+            lines.append(f"## {m['score']}점{flag} · {m['company']} — {m['title']}{sb}")
             lines.append("")
             age = m.get("age")
             age_s = f" | 등록 {age}일 전" if age is not None else ""
@@ -698,6 +861,7 @@ _DASH_TEMPLATE = """<meta charset="utf-8">
   a.job{color:#1565c0;text-decoration:none;font-weight:600}
   a.job:hover{text-decoration:underline}
   .ol{color:#6b7887;font-size:12px;margin-top:3px;max-width:420px}
+  .src{font-size:11px;color:#8a97a6;margin-left:6px;white-space:nowrap}
   .vd{white-space:nowrap;font-size:12px;color:#43536a}
   .foot{color:#98a5b3;font-size:12px;margin-top:12px;text-align:center}
   .empty{padding:30px;text-align:center;color:#98a5b3}
@@ -742,6 +906,7 @@ function render(){
     tr.appendChild(cell(r.company));
     const jc=document.createElement('td');const a=document.createElement('a');
     a.className='job';a.href=r.url;a.target='_blank';a.rel='noopener';a.textContent=r.title;jc.appendChild(a);
+    if(r.src){const s=document.createElement('span');s.className='src';s.textContent=r.src;jc.appendChild(s);}
     if(r.one_liner){const d=document.createElement('div');d.className='ol';d.textContent=r.one_liner;jc.appendChild(d);}
     tr.appendChild(jc);
     tr.appendChild(cell(r.career));
@@ -794,6 +959,7 @@ def write_dashboard(cfg, seen):
             "company": c.get("company", "?"), "title": c.get("title", "?"),
             "url": c.get("url", "#"), "career": c.get("career", "-"),
             "region": c.get("region", "-"), "one_liner": c.get("one_liner") or "",
+            "src": source_badge(c.get("sources")),
             "date": c.get("date", ""),
         })
     if not rows:
@@ -985,12 +1151,14 @@ def main():
             if stats["detail_fetched"] >= max_detail:
                 continue  # 이번 실행 상세 예산 소진(다음 실행에서 확인)
             try:
-                detail = fetch_detail(rid)
+                detail = fetch_detail_for(it)
                 stats["detail_fetched"] += 1
             except RuntimeError as e:
                 log(f"  ! 상세 실패({rid[:8]}): {e}")
                 continue
-            rec["created_at"] = detail.get("createdAt")
+            # 등록일 없으면(2차 소스 publishedAt 누락 등) first_seen로 폴백.
+            # None이면 age=None→영구 미신규 + 매 실행 재조회로 상세 예산 잠식하므로 방지.
+            rec["created_at"] = detail.get("createdAt") or rec.get("first_seen")
             age = created_age_days(rec.get("created_at"))
         if age is not None and age <= window:
             stats["fresh"] += 1
@@ -1026,7 +1194,7 @@ def main():
     to_crawl = {}
     for it, rsc, detail, age in to_score:
         if detail is None:
-            detail = fetch_detail(it["id"])
+            detail = fetch_detail_for(it)
         base = detail_to_text(detail)
         is_thin = len(base) < min_chars
         if (enr_cfg.get("enabled") and is_thin and detail.get("redirectUrl")
@@ -1085,6 +1253,7 @@ def main():
                 "url": m["url"], "verdict": m.get("verdict"),
                 "deadline": m.get("deadline"), "one_liner": m.get("one_liner"),
                 "career": m["career"], "region": m["region"],
+                "sources": m.get("sources"),
                 "llm": m.get("llm") is not None, "date": today,
             }
 

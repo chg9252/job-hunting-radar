@@ -34,6 +34,16 @@
     "new_within_days": 7,
     "max_detail_fetches": 200
   },
+  "_sources_comment": "옵션: 다중 소스. sources[]가 있으면 수집은 이 배열을 사용(신규판정 new_within_days·max_detail_fetches는 계속 위 search에서 읽음). platform(1차)은 per-source search 생략 시 위 search.filters를 그대로 사용(하위호환). 각 소스 베이스·이름은 .env(PLATFORM_*, PLATFORM_B_*)로만.",
+  "sources": [
+    { "type": "platform", "enabled": true },
+    {
+      "type": "platform_b",
+      "enabled": false,
+      "_comment": "2번째 소스(비공식). 켜려면 .env에 PLATFORM_B_* 채우고 enabled=true. job_categories는 소스가 쓰는 숫자 카테고리 id. 목록에 마감일·경력·스택이 있으면 마감일 LLM 추출 불필요.",
+      "search": { "job_categories": [1], "max_pages": 3, "page_size": 30, "sort": "relation" }
+    }
+  ],
   "filter": {
     "target_depth_ones": [
       "IT_개발",
